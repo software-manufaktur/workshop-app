@@ -1,0 +1,106 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand: #af9778;
+  --color-brand-dark: #8c7457;
+  --color-graysoft: #e6e6e6;
+  --color-graymid: #cccbcd;
+  --color-whatsapp: #128c7e;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    min-height: 100dvh;
+    background: #fff;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -2;
+    background: url("/bg.jpg") center / cover no-repeat;
+  }
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background: linear-gradient(to bottom, rgb(255 255 255 / 0.85), rgb(255 255 255 / 0.92));
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+}
+
+@layer components {
+  .safe-top {
+    padding-top: max(1rem, env(safe-area-inset-top));
+  }
+  .safe-bottom {
+    padding-bottom: max(7rem, calc(env(safe-area-inset-bottom) + 5rem));
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-1 rounded-xl px-4 py-2.5 text-sm font-medium transition active:scale-[.98] disabled:opacity-50;
+    min-height: 44px; /* Apple-Mindestgröße für Tippflächen */
+  }
+  .btn-sm {
+    @apply px-3 py-2 text-sm;
+    min-height: 40px;
+  }
+  .btn-primary {
+    @apply bg-brand text-white hover:bg-brand-dark;
+  }
+  .btn-soft {
+    @apply bg-graysoft text-slate-800 hover:bg-graymid;
+  }
+  .btn-danger {
+    @apply bg-rose-100 text-rose-700 hover:bg-rose-200;
+  }
+  .btn-whatsapp {
+    @apply bg-whatsapp text-white hover:opacity-90;
+  }
+  .btn-close {
+    @apply h-10 w-10 rounded-full text-slate-500 hover:bg-graysoft;
+  }
+  .field {
+    @apply w-full rounded-xl border border-graymid/70 bg-white/90 px-3 py-2.5 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/30;
+  }
+  .lbl {
+    @apply flex flex-col gap-1 text-sm text-slate-700;
+  }
+  .menu-item {
+    @apply block w-full px-4 py-3 text-left text-sm text-slate-700 hover:bg-gray-100;
+  }
+  .dlg {
+    @apply m-auto w-[calc(100%-1.5rem)] max-w-xl rounded-2xl bg-white p-5 shadow-2xl;
+    max-height: calc(100dvh - 2rem - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+  .dlg::backdrop {
+    background: rgb(0 0 0 / 0.4);
+  }
+  .dlg-title {
+    @apply text-lg font-semibold text-brand;
+  }
+  .badge {
+    @apply inline-block rounded-lg px-2 py-0.5 text-xs;
+  }
+  .toast {
+    @apply fixed left-1/2 z-50 max-w-[90%] -translate-x-1/2 rounded-xl border bg-white/95 px-4 py-3 text-center text-sm shadow-xl backdrop-blur;
+    bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+  .toast[data-type="success"] {
+    @apply border-emerald-300 bg-emerald-50;
+  }
+  .toast[data-type="error"] {
+    @apply border-rose-300 bg-rose-50 text-rose-900;
+  }
+  details[open] > summary .chevron {
+    transform: rotate(90deg);
+  }
+}
