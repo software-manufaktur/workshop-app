@@ -9,6 +9,8 @@ export interface Slot {
   capacity: number;
   archived: boolean;
   notes: string;
+  /** Unbekannte Felder aus älteren/fremden Datenständen – werden unverändert mitgeführt. */
+  extra?: Record<string, unknown>;
 }
 
 export interface Booking {
@@ -24,8 +26,11 @@ export interface Booking {
   created_at: string;
   /** Kunde hat zugestimmt, nach dem Workshop um Feedback gebeten zu werden. */
   reviewConsent: boolean;
+  /** Wann die Einwilligung erfasst wurde (Nachweis). */
+  reviewConsentAt: string | null;
   /** Zeitpunkt, an dem die Feedback-Anfrage verschickt wurde. */
   reviewRequestedAt: string | null;
+  extra?: Record<string, unknown>;
 }
 
 export interface Settings {
@@ -47,8 +52,20 @@ export interface UiState {
 
 export interface Meta {
   updatedAt: string | null;
+  /** Wird bei jeder inhaltlichen Änderung um 1 erhöht. */
+  revision: number;
+  /** Revision, die zuletzt erfolgreich automatisch gesichert wurde. */
+  lastBackupRevision: number | null;
   lastBackupAt: string | null;
   lastExportAt: string | null;
+}
+
+/** Einträge, die beim Import nicht als Termin/Buchung lesbar waren. Sie werden aufbewahrt, nie verworfen. */
+export interface QuarantineEntry {
+  kind: "slot" | "booking";
+  reason: string;
+  raw: unknown;
+  at: string;
 }
 
 export interface AppState {
@@ -58,6 +75,7 @@ export interface AppState {
   settings: Settings;
   ui: UiState;
   meta: Meta;
+  quarantine: QuarantineEntry[];
 }
 
 export const SALUTATIONS = ["Liebe/r", "Liebe", "Lieber", "Hallo"];
@@ -118,9 +136,12 @@ export function emptyState(): AppState {
     bookings: [],
     settings: defaultSettings(),
     ui: { collapsedActive: false, collapsedArchive: true, collapsedSlots: [] },
-    meta: { updatedAt: null, lastBackupAt: null, lastExportAt: null },
+    meta: { updatedAt: null, revision: 0, lastBackupRevision: null, lastBackupAt: null, lastExportAt: null },
+    quarantine: [],
   };
 }
+
+export const isEmptyState = (s: AppState) => s.slots.length === 0 && s.bookings.length === 0;
 
 export function uid(): string {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
@@ -132,14 +153,18 @@ export function uid(): string {
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
 const str = (v: unknown, def = ""): string => (typeof v === "string" ? v : typeof v === "number" ? String(v) : def);
-const bool = (v: unknown, def = false): boolean => (typeof v === "boolean" ? v : def);
-const isoOrNull = (v: unknown): string | null => {
-  if (typeof v !== "string" || !v) return null;
-  return Number.isNaN(new Date(v).getTime()) ? null : v;
+const bool = (v: unknown, def = false): boolean =>
+  typeof v === "boolean" ? v : v === "true" ? true : v === "false" ? false : def;
+/** ISO-String oder Zeitstempel (ms) → ISO-String; sonst null. */
+const toIso = (v: unknown): string | null => {
+  if (typeof v === "number" && Number.isFinite(v)) return new Date(v).toISOString();
+  if (typeof v !== "string" || !v.trim()) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : v;
 };
-const posInt = (v: unknown, def: number): number => {
-  const n = Math.floor(Number(v));
-  return Number.isFinite(n) && n > 0 ? n : def;
+const intOrNull = (v: unknown): number | null => {
+  const n = typeof v === "string" ? Number(v.trim()) : typeof v === "number" ? v : NaN;
+  return Number.isFinite(n) && Number.isInteger(n) ? n : null;
 };
 const strList = (v: unknown, def: string[]): string[] => {
   if (!Array.isArray(v)) return def;
@@ -147,43 +172,257 @@ const strList = (v: unknown, def: string[]): string[] => {
   return list.length ? list : def;
 };
 
-function normalizeSlot(raw: unknown): Slot | null {
-  if (!isObj(raw)) return null;
-  const id = str(raw.id);
-  const starts = isoOrNull(raw.starts_at);
-  if (!id || !starts) return null;
-  const ends = isoOrNull(raw.ends_at) ?? new Date(new Date(starts).getTime() + 2 * 3600_000).toISOString();
+const SLOT_KEYS = new Set(["id", "title", "starts_at", "ends_at", "capacity", "archived", "notes", "extra"]);
+const BOOKING_KEYS = new Set([
+  "id",
+  "slotId",
+  "salutation",
+  "name",
+  "phone",
+  "email",
+  "count",
+  "channel",
+  "notes",
+  "created_at",
+  "reviewConsent",
+  "reviewConsentAt",
+  "reviewRequestedAt",
+  "extra",
+]);
+
+function extraFields(raw: Obj, known: Set<string>): Record<string, unknown> | undefined {
+  const extra: Record<string, unknown> = isObj(raw.extra) ? { ...raw.extra } : {};
+  for (const [k, v] of Object.entries(raw)) if (!known.has(k)) extra[k] = v;
+  return Object.keys(extra).length ? extra : undefined;
+}
+
+export const PLACEHOLDER_NOTE =
+  "Automatisch angelegt: Zu diesen Buchungen wurde beim Import kein passender Termin gefunden. Bitte prüfen und ggf. Datum/Titel ergänzen.";
+
+export interface ImportReport {
+  slotsIn: number;
+  bookingsIn: number;
+  slotsOut: number;
+  bookingsOut: number;
+  /** Nicht lesbare Einträge (aufbewahrt in state.quarantine). */
+  quarantined: number;
+  /** Ersatz-Termine für Buchungen ohne gültigen Termin. */
+  placeholders: number;
+  /** Enthielt die Quelle eigene Einstellungen (Textvorlagen usw.)? */
+  hasSettings: boolean;
+  /** Verständliche Hinweise zu allem, was repariert/angepasst wurde. */
+  issues: string[];
+}
+
+class IssueCollector {
+  private counts = new Map<string, number>();
+  add(msg: string) {
+    this.counts.set(msg, (this.counts.get(msg) ?? 0) + 1);
+  }
+  list(): string[] {
+    return [...this.counts].map(([msg, n]) => (n > 1 ? `${n}× ${msg}` : msg));
+  }
+}
+
+/**
+ * Wandelt beliebige gespeicherte/importierte Daten in einen gültigen AppState um
+ * und berichtet, was dabei angepasst wurde. Grundsatz: Es verschwindet nichts.
+ *  - Unbekannte Felder bleiben in `extra` erhalten.
+ *  - Ungültige Werte werden repariert, der Originalwert bleibt in `extra` erhalten.
+ *  - Buchungen ohne passenden Termin bekommen einen (archivierten) Ersatz-Termin.
+ *  - Völlig unlesbare Einträge landen in `quarantine` (werden mitgesichert).
+ * Unterstützt:
+ *  - aktuellen Stand (schemaVersion 2)
+ *  - Backups der alten Web-App: { version: 1, slots, bookings }
+ *  - Backups der "tempio"-Entwicklungsversion: { state: { slots, bookings } }
+ *  - eigene Sicherungsdateien: { app: "seeyou-workshops", state: {...} }
+ * Wirft, wenn keine Termin-/Buchungslisten erkennbar sind.
+ */
+export function normalizeWithReport(input: unknown, now = new Date()): { state: AppState; report: ImportReport } {
+  let raw: unknown = input;
+  if (isObj(raw) && isObj(raw.state) && !Array.isArray(raw.slots)) raw = raw.state;
+  if (!isObj(raw) || !Array.isArray(raw.slots) || !Array.isArray(raw.bookings)) {
+    throw new Error("Unbekanntes Datenformat – keine Termine/Buchungen gefunden.");
+  }
+  const issues = new IssueCollector();
+  const nowIso = now.toISOString();
+  const quarantine: QuarantineEntry[] = Array.isArray(raw.quarantine)
+    ? raw.quarantine.filter(isObj).map((q) => ({
+        kind: q.kind === "slot" ? "slot" : "booking",
+        reason: str(q.reason, "unbekannt"),
+        raw: q.raw,
+        at: toIso(q.at) ?? nowIso,
+      }))
+    : [];
+  const quarantinedBefore = quarantine.length;
+
+  /* --- Termine --- */
+  const slots: Slot[] = [];
+  const slotIds = new Set<string>();
+  for (const r of raw.slots) {
+    if (!isObj(r)) {
+      quarantine.push({ kind: "slot", reason: "Eintrag ist kein Termin-Objekt", raw: r, at: nowIso });
+      issues.add("Termin-Eintrag war nicht lesbar und wurde zur Prüfung aufbewahrt");
+      continue;
+    }
+    const extra = extraFields(r, SLOT_KEYS) ?? {};
+    let id = str(r.id).trim();
+    if (!id || slotIds.has(id)) {
+      if (id) extra.originalId = id;
+      issues.add(id ? "Termin mit doppelter ID erhielt eine neue ID" : "Termin ohne ID erhielt eine neue ID");
+      id = uid();
+    }
+    let starts = toIso(r.starts_at);
+    let title = str(r.title).trim() || "Workshop";
+    if (!starts) {
+      extra.originalStartsAt = r.starts_at ?? null;
+      starts = new Date(0).toISOString();
+      title = `${title} (Datum ungültig)`;
+      issues.add("Termin ohne gültiges Datum übernommen (Titel markiert, im Archiv)");
+    }
+    let ends = toIso(r.ends_at);
+    if (!ends || new Date(ends) < new Date(starts)) {
+      if (r.ends_at !== undefined) extra.originalEndsAt = r.ends_at;
+      ends = new Date(new Date(starts).getTime() + 2 * 3600_000).toISOString();
+      if (r.ends_at !== undefined) issues.add("Termin mit ungültigem Ende: Ende auf Beginn + 2 Std. gesetzt");
+    }
+    const capRaw = intOrNull(r.capacity);
+    let capacity = capRaw ?? 0;
+    if (capRaw === null || capRaw < 1) {
+      extra.originalCapacity = r.capacity ?? null;
+      capacity = -1; // wird unten anhand der Buchungen gesetzt
+      issues.add("Termin mit ungültiger Platzanzahl: auf Anzahl der Buchungen (mind. 1) gesetzt");
+    }
+    slotIds.add(id);
+    slots.push({
+      id,
+      title,
+      starts_at: starts,
+      ends_at: ends,
+      capacity,
+      archived: bool(r.archived) || title.endsWith("(Datum ungültig)"),
+      notes: str(r.notes),
+      ...(Object.keys(extra).length ? { extra } : {}),
+    });
+  }
+
+  /* --- Buchungen --- */
+  const bookings: Booking[] = [];
+  const bookingIds = new Set<string>();
+  const orphanGroups = new Map<string, Booking[]>();
+  for (const r of raw.bookings) {
+    if (!isObj(r)) {
+      quarantine.push({ kind: "booking", reason: "Eintrag ist kein Buchungs-Objekt", raw: r, at: nowIso });
+      issues.add("Buchungs-Eintrag war nicht lesbar und wurde zur Prüfung aufbewahrt");
+      continue;
+    }
+    const extra = extraFields(r, BOOKING_KEYS) ?? {};
+    let id = str(r.id).trim();
+    if (!id || bookingIds.has(id)) {
+      if (id) extra.originalId = id;
+      issues.add(id ? "Buchung mit doppelter ID erhielt eine neue ID" : "Buchung ohne ID erhielt eine neue ID");
+      id = uid();
+    }
+    bookingIds.add(id);
+    const countRaw = intOrNull(r.count);
+    let count = countRaw ?? 1;
+    if (countRaw === null || countRaw < 1) {
+      extra.originalCount = r.count ?? null;
+      count = 1;
+      issues.add("Buchung mit ungültiger Personenzahl: auf 1 gesetzt (Originalwert gespeichert)");
+    }
+    const name = str(r.name).trim();
+    if (!name) issues.add("Buchung ohne Namen übernommen");
+    const booking: Booking = {
+      id,
+      slotId: str(r.slotId).trim(),
+      salutation: str(r.salutation, "Liebe/r") || "Liebe/r",
+      name: name || "(ohne Namen)",
+      phone: str(r.phone).trim(),
+      email: str(r.email).trim(),
+      count,
+      channel: str(r.channel),
+      notes: str(r.notes),
+      created_at: toIso(r.created_at) ?? new Date(0).toISOString(),
+      reviewConsent: bool(r.reviewConsent),
+      reviewConsentAt: bool(r.reviewConsent) ? toIso(r.reviewConsentAt) : null,
+      reviewRequestedAt: toIso(r.reviewRequestedAt),
+      ...(Object.keys(extra).length ? { extra } : {}),
+    };
+    if (!slotIds.has(booking.slotId)) {
+      const key = booking.slotId || "ohne-termin";
+      if (!orphanGroups.has(key)) orphanGroups.set(key, []);
+      orphanGroups.get(key)!.push(booking);
+    }
+    bookings.push(booking);
+  }
+
+  /* --- Ersatz-Termine für Buchungen ohne Termin --- */
+  for (const [key, list] of orphanGroups) {
+    const id = slotIds.has(key) ? uid() : key;
+    const first = list.map((b) => b.created_at).sort()[0] ?? new Date(0).toISOString();
+    slots.push({
+      id,
+      title: "Unbekannter Termin",
+      starts_at: first,
+      ends_at: first,
+      capacity: list.reduce((n, b) => n + b.count, 0),
+      archived: true,
+      notes: PLACEHOLDER_NOTE,
+      extra: { placeholder: true, originalSlotId: key === "ohne-termin" ? null : key },
+    });
+    slotIds.add(id);
+    for (const b of list) b.slotId = id;
+    issues.add(`${list.length} Buchung(en) ohne passenden Termin einem Ersatz-Termin „Unbekannter Termin“ zugeordnet`);
+  }
+
+  /* --- ungültige Kapazitäten anhand der Buchungen setzen --- */
+  for (const s of slots) {
+    if (s.capacity === -1) {
+      s.capacity = Math.max(1, bookings.filter((b) => b.slotId === s.id).reduce((n, b) => n + b.count, 0));
+    }
+  }
+
+  const ui = isObj(raw.ui) ? raw.ui : {};
+  const meta = isObj(raw.meta) ? raw.meta : {};
+  const base = emptyState();
+  const revision = intOrNull(meta.revision);
+  const lastBackupRevision = intOrNull(meta.lastBackupRevision);
+  const state: AppState = {
+    schemaVersion: 2,
+    slots,
+    bookings,
+    settings: normalizeSettings(raw.settings),
+    ui: {
+      collapsedActive: bool(ui.collapsedActive, base.ui.collapsedActive),
+      collapsedArchive: bool(ui.collapsedArchive, base.ui.collapsedArchive),
+      collapsedSlots: strList(ui.collapsedSlots, []).filter((id) => slotIds.has(id)),
+    },
+    meta: {
+      updatedAt: toIso(meta.updatedAt),
+      revision: revision !== null && revision >= 0 ? revision : 0,
+      lastBackupRevision: lastBackupRevision !== null && lastBackupRevision >= 0 ? lastBackupRevision : null,
+      lastBackupAt: toIso(meta.lastBackupAt),
+      lastExportAt: toIso(meta.lastExportAt),
+    },
+    quarantine,
+  };
   return {
-    id,
-    title: str(raw.title, "Workshop").trim() || "Workshop",
-    starts_at: starts,
-    ends_at: ends,
-    capacity: posInt(raw.capacity, 1),
-    archived: bool(raw.archived),
-    notes: str(raw.notes),
+    state,
+    report: {
+      slotsIn: raw.slots.length,
+      bookingsIn: raw.bookings.length,
+      slotsOut: slots.length,
+      bookingsOut: bookings.length,
+      quarantined: quarantine.length - quarantinedBefore,
+      placeholders: orphanGroups.size,
+      hasSettings: isObj(raw.settings),
+      issues: issues.list(),
+    },
   };
 }
 
-function normalizeBooking(raw: unknown): Booking | null {
-  if (!isObj(raw)) return null;
-  const id = str(raw.id);
-  const slotId = str(raw.slotId);
-  if (!id || !slotId) return null;
-  return {
-    id,
-    slotId,
-    salutation: str(raw.salutation, "Liebe/r") || "Liebe/r",
-    name: str(raw.name).trim(),
-    phone: str(raw.phone).trim(),
-    email: str(raw.email).trim(),
-    count: posInt(raw.count, 1),
-    channel: str(raw.channel),
-    notes: str(raw.notes),
-    created_at: isoOrNull(raw.created_at) ?? new Date(0).toISOString(),
-    reviewConsent: bool(raw.reviewConsent),
-    reviewRequestedAt: isoOrNull(raw.reviewRequestedAt),
-  };
-}
+export const normalizeState = (input: unknown): AppState => normalizeWithReport(input).state;
 
 function normalizeSettings(raw: unknown): Settings {
   const d = defaultSettings();
@@ -201,48 +440,8 @@ function normalizeSettings(raw: unknown): Settings {
   };
 }
 
-/**
- * Wandelt beliebige gespeicherte/importierte Daten in einen gültigen AppState um.
- * Unterstützt:
- *  - aktuellen Stand (schemaVersion 2)
- *  - Backups der alten Web-App: { version: 1, slots, bookings }
- *  - Backups der "tempio"-Entwicklungsversion: { state: { slots, bookings } }
- * Wirft, wenn keine Termin-/Buchungslisten erkennbar sind.
- */
-export function normalizeState(input: unknown): AppState {
-  let raw: unknown = input;
-  if (isObj(raw) && isObj(raw.state) && !Array.isArray(raw.slots)) raw = raw.state;
-  if (!isObj(raw) || !Array.isArray(raw.slots) || !Array.isArray(raw.bookings)) {
-    throw new Error("Unbekanntes Datenformat – keine Termine/Buchungen gefunden.");
-  }
-  const base = emptyState();
-  const slots = raw.slots.map(normalizeSlot).filter((s): s is Slot => s !== null);
-  const slotIds = new Set(slots.map((s) => s.id));
-  const bookings = raw.bookings
-    .map(normalizeBooking)
-    .filter((b): b is Booking => b !== null && slotIds.has(b.slotId));
-  const ui = isObj(raw.ui) ? raw.ui : {};
-  const meta = isObj(raw.meta) ? raw.meta : {};
-  return {
-    ...base,
-    slots,
-    bookings,
-    settings: normalizeSettings(raw.settings),
-    ui: {
-      collapsedActive: bool(ui.collapsedActive, base.ui.collapsedActive),
-      collapsedArchive: bool(ui.collapsedArchive, base.ui.collapsedArchive),
-      collapsedSlots: strList(ui.collapsedSlots, []).filter((id) => slotIds.has(id)),
-    },
-    meta: {
-      updatedAt: isoOrNull(meta.updatedAt),
-      lastBackupAt: isoOrNull(meta.lastBackupAt),
-      lastExportAt: isoOrNull(meta.lastExportAt),
-    },
-  };
-}
-
 /** Liest die Schlüssel der alten Web-App (localStorage) ein. */
-export function fromLegacyLocalStorage(get: (key: string) => string | null): AppState | null {
+export function fromLegacyLocalStorage(get: (key: string) => string | null): { state: AppState; report: ImportReport } | null {
   const slotsRaw = get("seeyou_slots_v1");
   const bookingsRaw = get("seeyou_bookings_v1");
   if (!slotsRaw && !bookingsRaw) return null;
@@ -253,18 +452,29 @@ export function fromLegacyLocalStorage(get: (key: string) => string | null): App
       return def;
     }
   };
-  const state = normalizeState({
-    slots: parse(slotsRaw, []),
-    bookings: parse(bookingsRaw, []),
+  const slots = parse(slotsRaw, null);
+  const bookings = parse(bookingsRaw, null);
+  // Unlesbare Altdaten nicht als "leer" behandeln – sonst würden sie überschrieben
+  if ((slotsRaw && !Array.isArray(slots)) || (bookingsRaw && !Array.isArray(bookings))) {
+    throw new Error("Die gespeicherten Daten der bisherigen Version sind beschädigt und wurden nicht verändert.");
+  }
+  const template = parse(get("seeyou_whatsapp_template_v1"), null);
+  const result = normalizeWithReport({
+    slots: slots ?? [],
+    bookings: bookings ?? [],
+    settings: typeof template === "string" && template.trim() ? { confirmationTemplate: template } : undefined,
     ui: {
       collapsedActive: parse(get("seeyou_active_collapsed_v1"), false),
       collapsedArchive: parse(get("seeyou_arch_collapsed_v1"), true),
       collapsedSlots: parse(get("seeyou_collapsed_slots_v1"), []),
     },
   });
-  const template = parse(get("seeyou_whatsapp_template_v1"), null);
-  if (typeof template === "string" && template.trim()) state.settings.confirmationTemplate = template;
-  return state;
+  const lastBackupDay = get("seeyou_last_backup_v1");
+  if (lastBackupDay && /^\d{4}-\d{2}-\d{2}$/.test(lastBackupDay)) {
+    result.state.meta.lastExportAt = new Date(`${lastBackupDay}T12:00:00Z`).toISOString();
+  }
+  result.report.hasSettings = true;
+  return result;
 }
 
 /* ---------- Abgeleitete Werte ---------- */
@@ -294,6 +504,10 @@ export function autoArchive(state: AppState, now = new Date(), graceDays = 3): b
   }
   return changed;
 }
+
+/** Kurzbeschreibung eines Datenstands für Bestätigungsdialoge. */
+export const describeState = (s: Pick<AppState, "slots" | "bookings">) =>
+  `${s.slots.length} Termine, ${s.bookings.length} Buchungen`;
 
 export function normalizePhoneDE(raw: string): string {
   let d = (raw || "").replace(/\D+/g, "");

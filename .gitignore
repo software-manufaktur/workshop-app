@@ -12,3 +12,5 @@ ios/DerivedData/
 ios/App/build/
 *.xcuserstate
 xcuserdata/
+test-results/
+playwright-report/

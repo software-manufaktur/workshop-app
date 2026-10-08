@@ -119,7 +119,7 @@ export function buildCsv(state: AppState): string {
         b.count,
         b.channel,
         b.notes,
-        b.reviewConsent ? "ja" : "nein",
+        b.reviewConsent ? (b.reviewConsentAt ? `ja (${fmtDateTime(b.reviewConsentAt)})` : "ja") : "nein",
         b.reviewRequestedAt ? fmtDateTime(b.reviewRequestedAt) : "",
         b.created_at && !b.created_at.startsWith("1970") ? fmtDateTime(b.created_at) : "",
       ]);

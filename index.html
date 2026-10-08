@@ -125,15 +125,21 @@
       <button type="button" class="btn-close" data-close aria-label="Schließen">✕</button>
     </div>
     <div id="bkp_native" class="hidden space-y-3">
-      <p class="text-sm text-slate-700">Die App sichert nach jeder Änderung automatisch in <strong>iCloud Drive → SeeYou Workshops</strong>. Pro Tag wird eine Datei behalten (60 Tage).</p>
+      <p class="text-sm text-slate-700">Die App sichert nach jeder Änderung automatisch in <strong>iCloud Drive → SeeYou Workshops</strong> (Tagessicherungen der letzten 60 Tage). Vor Import, Wiederherstellung und Löschen eines Termins entsteht zusätzlich ein unveränderlicher Wiederherstellungspunkt.</p>
       <div id="bkp_state" class="text-sm rounded-xl bg-graysoft/60 px-3 py-2"></div>
       <button type="button" id="bkp_now" class="btn btn-primary w-full sm:w-auto">Jetzt sichern</button>
       <h3 class="font-medium mt-2">Vorhandene Sicherungen</h3>
-      <ul id="bkp_list" class="divide-y divide-gray-100 max-h-64 overflow-auto"></ul>
     </div>
     <div id="bkp_web" class="hidden space-y-2 text-sm text-slate-700">
       <p>In der Web-Version kann nicht automatisch gesichert werden. Bitte regelmäßig eine Sicherung exportieren und z. B. in iCloud Drive ablegen.</p>
       <p id="bkp_webLast" class="text-slate-500"></p>
+      <p>Vor Import, Wiederherstellung und Löschen eines Termins legt die App automatisch einen Wiederherstellungspunkt im Browser an (die letzten 5).</p>
+      <h3 class="font-medium text-slate-900 mt-2">Wiederherstellungspunkte</h3>
+    </div>
+    <ul id="bkp_list" class="divide-y divide-gray-100 max-h-64 overflow-auto"></ul>
+    <div id="bkp_quarantine" class="hidden mt-3 rounded-xl bg-amber-100 text-amber-900 text-sm px-3 py-2 space-y-2">
+      <p id="bkp_quarantineText"></p>
+      <button type="button" id="bkp_quarantineExport" class="btn btn-sm btn-soft">Diese Einträge exportieren</button>
     </div>
     <h3 class="font-medium mt-4 mb-2">Datei</h3>
     <div class="flex flex-col sm:flex-row gap-2">

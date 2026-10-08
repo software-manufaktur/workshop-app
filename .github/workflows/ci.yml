@@ -21,3 +21,15 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npx vite build
+      - name: Ende-zu-Ende-Tests (Chromium, iPhone-Ansicht)
+        run: |
+          npx playwright install --with-deps chromium
+          npm run e2e
+
+  swift-plugin:
+    name: Swift-Plugin (Dateilogik, Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.1-noble
+    steps:
+      - uses: actions/checkout@v4
+      - run: ios/native-tests/run.sh

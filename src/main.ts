@@ -6,12 +6,15 @@ import {
   bookedCount,
   bookingsForSlot,
   defaultSettings,
+  describeState,
+  isEmptyState,
   isValidEmail,
   normalizePhoneDE,
   slotStatus,
   uid,
   type AppState,
   type Booking,
+  type ImportReport,
   type Slot,
   type SlotStatus,
 } from "./model";
@@ -29,22 +32,37 @@ import {
   toLocalInput,
   whatsappUrl,
 } from "./format";
-import { isNative, openExternal, requestPersistentStorage, shareFile } from "./platform";
 import {
-  backupJson,
-  flushBackup,
-  getBackupStatus,
-  getState,
-  initStore,
-  listBackups,
-  onBackupStatus,
-  parseBackup,
-  readBackup,
-  replaceState,
-  runBackup,
-  subscribe,
-  update,
-} from "./store";
+  createBackupDriver,
+  createStateStorage,
+  isNative,
+  legacyGet,
+  openExternal,
+  requestPersistentStorage,
+  shareFile,
+} from "./platform";
+import { Store, StoreLockedError, type UpdateOptions } from "./store";
+import { BackupManager, backupFileContent, parseBackupText, type BackupEntry, type RestorePointReason } from "./backup";
+
+/* ---------- Zustand & Sicherung ---------- */
+
+const store = new Store(createStateStorage(), { legacyGet });
+const backups = new BackupManager(
+  createBackupDriver(),
+  () => store.get(),
+  async (revision, at) => {
+    await store.update((d) => {
+      d.meta.lastBackupRevision = revision;
+      d.meta.lastBackupAt = at;
+    });
+  },
+  // Web: keine Tagessicherungen möglich, nur wenige Wiederherstellungspunkte im Browser
+  isNative ? {} : { dailyEnabled: false, maxRestorePoints: 5, minKeep: 0 },
+);
+store.onContentChange(() => backups.schedule());
+
+const getState = () => store.get();
+const update = (mutator: (draft: AppState) => void, opts?: UpdateOptions) => store.update(mutator, opts);
 
 const APP_VERSION = __APP_VERSION__;
 
@@ -77,7 +95,8 @@ function toast(msg: string, type: "info" | "success" | "error" = "info") {
   toastTimer = setTimeout(() => el.classList.add("hidden"), type === "error" ? 6000 : 3500);
 }
 
-function confirmDialog(title: string, text: string, okLabel = "OK", danger = true): Promise<boolean> {
+function confirmDialog(title: string, text: string, okLabel = "OK", danger = true, infoOnly = false): Promise<boolean> {
+  $("#cf_cancel").classList.toggle("hidden", infoOnly);
   $("#cf_title").textContent = title;
   $("#cf_text").textContent = text;
   const ok = $<HTMLButtonElement>("#cf_ok");
@@ -98,12 +117,12 @@ function confirmDialog(title: string, text: string, okLabel = "OK", danger = tru
   });
 }
 
-async function safely(action: () => Promise<void> | void, errorPrefix = "Fehler") {
+async function safely(action: () => Promise<unknown> | void, errorPrefix = "Fehler") {
   try {
     await action();
   } catch (err) {
     if ((err as Error).name === "AbortError") return;
-    console.error(err);
+    if (!(err instanceof StoreLockedError)) console.error(err);
     toast(`${errorPrefix}: ${(err as Error).message}`, "error");
   }
 }
@@ -259,16 +278,26 @@ function render() {
 function renderBackupStatus() {
   const el = $("#backupStatus");
   const state = getState();
+  if (store.locked) {
+    el.className = "mb-2 text-sm rounded-xl px-3 py-2 bg-rose-100 text-rose-900 flex items-center justify-between gap-2";
+    el.innerHTML = `<span>⚠️ Die gespeicherten Daten sind nicht lesbar. Bitte eine Sicherung wiederherstellen – es wird nichts überschrieben.</span><button type="button" class="btn btn-sm btn-primary" data-action="backup">Sicherungen</button>`;
+    el.classList.remove("hidden");
+    return;
+  }
   if (isNative) {
-    const st = getBackupStatus();
-    const at = st.at ?? state.meta.lastBackupAt;
-    if (!st.ok) {
+    const st = backups.status;
+    const at = st.lastSuccessAt ?? state.meta.lastBackupAt;
+    if (st.phase === "error") {
+      const retry = st.nextRetryAt ? ` Neuer Versuch ${new Date(st.nextRetryAt).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })} Uhr.` : "";
       el.className = "mb-2 text-sm rounded-xl px-3 py-2 bg-rose-100 text-rose-900 flex items-center justify-between gap-2";
-      el.innerHTML = `<span>⚠️ Sicherung fehlgeschlagen: ${esc(st.error ?? "")}</span><button type="button" class="btn btn-sm btn-soft" data-action="backup">Details</button>`;
+      el.innerHTML = `<span>⚠️ Sicherung fehlgeschlagen: ${esc(st.message ?? "")}.${esc(retry)}</span><button type="button" class="btn btn-sm btn-soft" data-action="backup">Details</button>`;
+    } else if (st.location === "local") {
+      el.className = "mb-2 text-sm rounded-xl px-3 py-2 bg-amber-100 text-amber-900 flex items-center justify-between gap-2";
+      el.innerHTML = `<span>⚠️ iCloud Drive nicht verfügbar – vorerst nur auf dem iPhone gesichert (${esc(relTime(at))}).</span><button type="button" class="btn btn-sm btn-soft" data-action="backup">Details</button>`;
     } else {
-      const where = st.location === "local" ? "auf dem iPhone (iCloud nicht verfügbar)" : "in iCloud";
+      const pending = backups.isDirty() ? " · Änderungen werden gesichert …" : "";
       el.className = "mb-2 text-xs text-slate-500 px-1";
-      el.textContent = at ? `☁️ Automatisch ${where} gesichert · ${relTime(at)}` : "☁️ Automatische iCloud-Sicherung aktiv";
+      el.textContent = at ? `☁️ Automatisch in iCloud gesichert · ${relTime(at)}${pending}` : `☁️ Automatische iCloud-Sicherung aktiv${pending}`;
     }
     el.classList.remove("hidden");
     return;
@@ -385,6 +414,7 @@ async function deleteSlot(slot: Slot) {
     "Endgültig löschen",
   );
   if (!ok) return;
+  if (!(await safetyPoint("vor-Loeschen"))) return;
   await update((d) => {
     d.slots = d.slots.filter((s) => s.id !== slot.id);
     d.bookings = d.bookings.filter((b) => b.slotId !== slot.id);
@@ -443,6 +473,7 @@ $("#formBooking").addEventListener("submit", (ev) => {
       notes: textarea("#bk_notes").value.trim(),
       created_at: old?.created_at ?? new Date().toISOString(),
       reviewConsent: input("#bk_consent").checked,
+      reviewConsentAt: input("#bk_consent").checked ? (old?.reviewConsent ? old.reviewConsentAt : new Date().toISOString()) : null,
       reviewRequestedAt: old?.reviewRequestedAt ?? null,
     };
     if (!booking.name || !booking.phone || !(booking.count >= 1)) return toast("Bitte Name, Telefon und Personenzahl angeben.", "error");
@@ -604,57 +635,126 @@ dlgReview.addEventListener("click", (e) => {
     void safely(() =>
       update((d) => {
         const b = d.bookings.find((x) => x.id === id);
-        if (b) b.reviewConsent = true;
+        if (b) {
+          b.reviewConsent = true;
+          b.reviewConsentAt = new Date().toISOString();
+        }
       }),
     );
 });
 
 /* ---------- Sicherung ---------- */
 
+/**
+ * Legt vor einer kritischen Aktion einen unveränderlichen Wiederherstellungspunkt an.
+ * Gibt false zurück, wenn das nicht ging und die Nutzerin nicht trotzdem fortfahren möchte.
+ */
+async function safetyPoint(reason: RestorePointReason): Promise<boolean> {
+  const cur = getState();
+  if (isEmptyState(cur) || store.locked) return true;
+  try {
+    await backups.createRestorePoint(reason, cur);
+    return true;
+  } catch (err) {
+    return confirmDialog(
+      "Sicherheitskopie fehlgeschlagen",
+      `Vor dieser Aktion konnte kein Wiederherstellungspunkt angelegt werden:\n${(err as Error).message}\n\nTrotzdem fortfahren?`,
+      "Trotzdem fortfahren",
+    );
+  }
+}
+
 async function exportBackupFile() {
-  await shareFile(`SeeYou-Sicherung-${dateStamp()}.json`, backupJson(), "application/json");
-  await update((d) => (d.meta.lastExportAt = new Date().toISOString()), { silent: true });
+  await shareFile(`SeeYou-Export-${dateStamp()}.json`, backupFileContent(getState(), "export"), "application/json");
+  await update((d) => (d.meta.lastExportAt = new Date().toISOString()));
   toast("Sicherung exportiert", "success");
 }
 
-async function restoreFrom(next: AppState, source: string) {
+function reportText(report: ImportReport): string {
+  const lines: string[] = [];
+  if (report.issues.length) lines.push("Hinweise:", ...report.issues.map((i) => `• ${i}`));
+  if (!report.hasSettings)
+    lines.push("", "Diese Datei enthält keine Einstellungen (z. B. Sicherung der alten App). Deine aktuellen Textvorlagen und Listen bleiben erhalten – bitte danach die WhatsApp-Vorlage unter Einstellungen prüfen.");
+  return lines.join("\n");
+}
+
+/** Ersetzt die Daten nach ausdrücklicher Bestätigung; vorher wird der aktuelle Stand gesichert. */
+async function restoreFrom(next: AppState, report: ImportReport | null, source: string, reason: RestorePointReason): Promise<boolean> {
   const cur = getState();
+  const details = report ? reportText(report) : "";
+  const curText = store.locked ? "Die bisherigen (unlesbaren) Daten bleiben als Kopie erhalten." : isEmptyState(cur) ? "Die App enthält derzeit keine Daten." : `Die aktuellen Daten (${describeState(cur)}) werden ersetzt – vorher wird ein Wiederherstellungspunkt angelegt.`;
   const ok = await confirmDialog(
-    "Sicherung wiederherstellen?",
-    `${source}\nenthält ${next.slots.length} Termine und ${next.bookings.length} Buchungen.\n\nDie aktuellen Daten (${cur.slots.length} Termine, ${cur.bookings.length} Buchungen) werden ersetzt.`,
+    "Daten wiederherstellen?",
+    `${source}\nenthält ${describeState(next)}.\n\n${curText}${details ? `\n\n${details}` : ""}`,
     "Wiederherstellen",
   );
   if (!ok) return false;
-  if (isNative && cur.slots.length) await runBackup(); // aktuellen Stand vorher noch sichern
-  await replaceState(next);
-  toast("Sicherung wiederhergestellt", "success");
+  if (!(await safetyPoint(reason))) return false;
+  // Datei ohne Einstellungen (z. B. Sicherung der alten App): eigene Texte/Listen behalten
+  const toApply = report && !report.hasSettings && !store.locked ? { ...next, settings: structuredClone(cur.settings) } : next;
+  await store.replaceAll(toApply);
+  toast(`Wiederhergestellt: ${describeState(next)}`, "success");
   return true;
 }
+
+const KIND_LABEL: Record<BackupEntry["kind"], string> = {
+  daily: "Tagessicherung",
+  "restore-point": "Wiederherstellungspunkt",
+  other: "Datei",
+};
+const SOURCE_LABEL: Record<BackupEntry["kind"], string> = {
+  daily: "Die Tagessicherung",
+  "restore-point": "Der Wiederherstellungspunkt",
+  other: "Die Datei",
+};
+const REASON_LABEL: Record<string, string> = {
+  "vor-Import": "vor Import",
+  "vor-Wiederherstellung": "vor Wiederherstellung",
+  "vor-Loeschen": "vor Löschen",
+  "vor-Ueberschreiben": "älterer Tagesstand",
+  "abweichender-Stand": "abweichender Stand",
+};
+const reasonOf = (name: string) => Object.keys(REASON_LABEL).find((r) => name.includes(`_${r}`));
+
+let backupEntries: BackupEntry[] = [];
 
 async function renderBackupDialog() {
   $("#bkp_native").classList.toggle("hidden", !isNative);
   $("#bkp_web").classList.toggle("hidden", isNative);
   const state = getState();
-  if (!isNative) {
-    $("#bkp_webLast").textContent = `Letzter Export: ${relTime(state.meta.lastExportAt)}`;
-    return;
+  const q = $("#bkp_quarantine");
+  q.classList.toggle("hidden", !state.quarantine.length);
+  const qn = state.quarantine.length;
+  $("#bkp_quarantineText").textContent = `${qn === 1 ? "1 Eintrag" : `${qn} Einträge`} aus einem Import ${qn === 1 ? "war" : "waren"} nicht lesbar. Sie wurden nicht gelöscht, sondern aufbewahrt und werden mitgesichert.`;
+  if (!isNative) $("#bkp_webLast").textContent = `Letzter Export: ${relTime(state.meta.lastExportAt)}`;
+  if (isNative) {
+    const st = backups.status;
+    const at = st.lastSuccessAt ?? state.meta.lastBackupAt;
+    const parts = [
+      st.phase === "error"
+        ? `❌ Letzter Versuch fehlgeschlagen: ${st.message ?? "unbekannt"}${st.nextRetryAt ? ` (neuer Versuch ${fmtDateTime(st.nextRetryAt)})` : ""}`
+        : `Letzte Sicherung: ${relTime(at)}${st.location === "local" ? " – nur auf dem iPhone, weil iCloud Drive nicht verfügbar ist (Einstellungen → [Name] → iCloud → iCloud Drive einschalten)." : ""}`,
+      backups.isDirty() ? "Es gibt Änderungen, die noch gesichert werden." : "",
+      st.phase !== "error" && st.message ? st.message : "",
+    ];
+    $("#bkp_state").textContent = parts.filter(Boolean).join(" ");
   }
-  const st = getBackupStatus();
-  $("#bkp_state").textContent = st.ok
-    ? `Letzte Sicherung: ${relTime(st.at ?? state.meta.lastBackupAt)}${st.location === "local" ? " – nur auf dem iPhone, weil iCloud Drive nicht verfügbar ist (Einstellungen → Apple-ID → iCloud → iCloud Drive)." : ""}`
-    : `Letzter Versuch fehlgeschlagen: ${st.error ?? "unbekannt"}`;
   const ul = $("#bkp_list");
   ul.innerHTML = `<li class="py-2 text-sm text-slate-500">Lade …</li>`;
   try {
-    const files = await listBackups();
-    ul.innerHTML = files.length
-      ? files
-          .map(
-            (f) => `<li class="flex items-center justify-between gap-2 py-2 text-sm">
-              <span class="min-w-0 truncate">${esc(f.name.replace("SeeYou-Sicherung-", "").replace(".json", ""))}<span class="block text-xs text-slate-500">${esc(fmtDateTime(f.modifiedAt))}</span></span>
-              <button type="button" class="btn btn-sm btn-soft" data-action="restore-file" data-name="${esc(f.name)}">Wiederherstellen</button>
-            </li>`,
-          )
+    backupEntries = (await backups.list()).filter((e) => e.kind !== "other");
+    ul.innerHTML = backupEntries.length
+      ? backupEntries
+          .map((f, i) => {
+            const reason = reasonOf(f.name);
+            const label = `${KIND_LABEL[f.kind]}${reason ? ` (${REASON_LABEL[reason]})` : ""}`;
+            const where = f.location === "icloud" ? "iCloud" : isNative ? "nur iPhone" : "Browser";
+            return `<li class="flex items-center justify-between gap-2 py-2 text-sm">
+              <span class="min-w-0">${esc(fmtDateTime(f.modifiedAt))}
+                <span class="block text-xs text-slate-500">${esc(label)} · ${esc(where)}${f.downloaded ? "" : " · wird geladen"}</span></span>
+              <button type="button" class="btn btn-sm btn-soft" data-action="restore-file" data-index="${i}">Wiederherstellen</button>
+            </li>`;
+          })
           .join("")
       : `<li class="py-2 text-sm text-slate-500">Noch keine Sicherungen vorhanden.</li>`;
   } catch (err) {
@@ -664,35 +764,40 @@ async function renderBackupDialog() {
 
 function openBackupDialog() {
   void renderBackupDialog();
-  dlgBackup.showModal();
+  if (!dlgBackup.open) dlgBackup.showModal();
 }
 
 $("#bkp_now").addEventListener("click", () =>
   safely(async () => {
-    await runBackup();
-    const st = getBackupStatus();
-    toast(st.ok ? "Gesichert" : `Sicherung fehlgeschlagen: ${st.error}`, st.ok ? "success" : "error");
+    const st = await backups.run(true);
+    if (st.phase === "skipped") toast(st.message ?? "Nichts zu sichern");
+    else toast(st.phase === "ok" ? "Gesichert" : `Sicherung fehlgeschlagen: ${st.message}`, st.phase === "ok" ? "success" : "error");
     await renderBackupDialog();
   }),
 );
 $("#bkp_export").addEventListener("click", () => safely(exportBackupFile, "Export fehlgeschlagen"));
+$("#bkp_quarantineExport").addEventListener("click", () =>
+  safely(() => shareFile(`SeeYou-nicht-lesbare-Eintraege-${dateStamp()}.json`, JSON.stringify(getState().quarantine, null, 2), "application/json")),
+);
 input("#bkp_import").addEventListener("change", (e) => {
   const el = e.target as HTMLInputElement;
   const file = el.files?.[0];
   el.value = "";
   if (!file) return;
   void safely(async () => {
-    const next = parseBackup(await file.text());
-    if (await restoreFrom(next, `Die Datei „${file.name}“`)) dlgBackup.close();
+    const { state: next, report } = parseBackupText(await file.text());
+    if (await restoreFrom(next, report, `Die Datei „${file.name}“`, "vor-Import")) dlgBackup.close();
   }, "Import fehlgeschlagen");
 });
 dlgBackup.addEventListener("click", (e) => {
   const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-action='restore-file']");
-  if (!btn?.dataset.name) return;
-  const name = btn.dataset.name;
+  const entry = backupEntries[Number(btn?.dataset.index)];
+  if (!btn || !entry) return;
   void safely(async () => {
-    const next = await readBackup(name);
-    if (await restoreFrom(next, `Die Sicherung „${name}“`)) dlgBackup.close();
+    btn.textContent = "Lade …";
+    const { state: next, report } = await backups.read(entry);
+    if (await restoreFrom(next, report, `${SOURCE_LABEL[entry.kind]} vom ${fmtDateTime(entry.modifiedAt)}`, "vor-Wiederherstellung")) dlgBackup.close();
+    else await renderBackupDialog();
   }, "Wiederherstellen fehlgeschlagen");
 });
 
@@ -818,7 +923,7 @@ async function handleAction(action: string, id: string) {
       break;
     }
     case "restore-latest":
-      openBackupDialog();
+      await restoreLatest();
       break;
   }
 }
@@ -870,8 +975,7 @@ listEl.addEventListener(
             : closed;
     // Beim Neuzeichnen feuert "toggle" ebenfalls – nur echte Änderungen speichern
     if (current === closed) return;
-    void update(
-      (d) => {
+    void update((d) => {
         if (el.id === "activeSection") d.ui.collapsedActive = closed;
         else if (el.id === "archSection") d.ui.collapsedArchive = closed;
         else if (el.dataset.slot) {
@@ -881,7 +985,6 @@ listEl.addEventListener(
           d.ui.collapsedSlots = [...set];
         }
       },
-      { silent: true },
     ).catch(() => {});
   },
   true,
@@ -889,21 +992,28 @@ listEl.addEventListener(
 
 /* ---------- Start ---------- */
 
+let restoreCandidate: { entry: BackupEntry; state: AppState } | null = null;
+
 async function setupOnboarding() {
-  if (getState().slots.length) return;
+  onboardingHtml = "";
+  if (!isEmptyState(getState()) && !store.locked) return;
   if (isNative) {
     try {
-      const files = await listBackups();
-      if (files.length) {
-        onboardingHtml = `<div class="mb-4 rounded-2xl bg-white/90 border border-brand/40 p-4 text-sm">
-          <p class="font-medium text-brand mb-1">Sicherung gefunden</p>
-          <p>In iCloud liegt eine Sicherung vom ${esc(fmtDateTime(files[0].modifiedAt))}.</p>
-          <button type="button" class="btn btn-primary mt-3" data-action="restore-latest">Sicherungen ansehen</button>
-        </div>`;
-        return;
-      }
+      restoreCandidate = await backups.findRestoreCandidate();
     } catch {
-      /* iCloud nicht erreichbar */
+      restoreCandidate = null; // iCloud nicht erreichbar
+    }
+    if (restoreCandidate) {
+      const { entry, state } = restoreCandidate;
+      onboardingHtml = `<div class="mb-4 rounded-2xl bg-white/90 border border-brand/40 p-4 text-sm space-y-2">
+        <p class="font-medium text-brand">Sicherung gefunden</p>
+        <p>${entry.location === "icloud" ? "In iCloud" : "Auf diesem iPhone"} liegt eine Sicherung vom <strong>${esc(fmtDateTime(entry.modifiedAt))}</strong> mit ${esc(describeState(state))}.</p>
+        <div class="flex flex-wrap gap-2">
+          <button type="button" class="btn btn-primary" data-action="restore-latest">Wiederherstellen …</button>
+          <button type="button" class="btn btn-soft" data-action="backup">Alle Sicherungen</button>
+        </div>
+      </div>`;
+      return;
     }
   }
   onboardingHtml = `<div class="mb-4 rounded-2xl bg-white/90 border border-brand/40 p-4 text-sm space-y-2">
@@ -911,6 +1021,16 @@ async function setupOnboarding() {
     <p>Daten aus der bisherigen App übernehmen: In der alten App im Menü auf <strong>„Backup“</strong> tippen und die Datei sichern. Hier dann <strong>Menü → Sicherung → Sicherung importieren</strong> wählen.</p>
     <button type="button" class="btn btn-soft" data-action="backup">Sicherung importieren</button>
   </div>`;
+}
+
+async function restoreLatest() {
+  if (!restoreCandidate) return openBackupDialog();
+  const { entry, state } = restoreCandidate;
+  if (await restoreFrom(state, null, `${SOURCE_LABEL[entry.kind]} vom ${fmtDateTime(entry.modifiedAt)}`, "vor-Wiederherstellung")) {
+    restoreCandidate = null;
+    onboardingHtml = "";
+    render();
+  }
 }
 
 async function registerServiceWorker() {
@@ -928,32 +1048,52 @@ async function registerServiceWorker() {
 }
 
 async function init() {
+  store.subscribe(render);
+  store.subscribe(() => {
+    if (dlgReview.open) renderReview();
+  });
+  backups.onStatus(renderBackupStatus);
+  let result: Awaited<ReturnType<Store["init"]>> | null = null;
   try {
-    const { migrated } = await initStore();
-    if (migrated) toast("Daten aus der bisherigen Version übernommen", "success");
+    result = await store.init();
   } catch (err) {
     console.error(err);
     toast(`Daten konnten nicht geladen werden: ${(err as Error).message}`, "error");
   }
-  await setupOnboarding();
-  subscribe(render);
-  subscribe(() => {
-    if (dlgReview.open) renderReview();
-  });
-  onBackupStatus(renderBackupStatus);
   render();
+  // Suche nach Sicherungen kann dauern (iCloud lädt Dateien nach) – Start nicht blockieren
+  if (isNative && (isEmptyState(getState()) || store.locked)) {
+    onboardingHtml = `<div class="mb-4 rounded-2xl bg-white/90 border border-brand/40 p-4 text-sm">Suche nach vorhandenen Sicherungen in iCloud …</div>`;
+    render();
+  }
+  void setupOnboarding().then(render);
+  if (result?.fatalError) {
+    toast(result.fatalError, "error");
+    openBackupDialog();
+  } else if (result?.recoveredFromPrevious) {
+    toast("Der zuletzt gespeicherte Stand war beschädigt – der vorherige Stand wurde geladen.", "error");
+  } else if (result?.migration) {
+    const m = result.migration;
+    toast(`Daten aus der bisherigen Version übernommen: ${m.slotsOut} Termine, ${m.bookingsOut} Buchungen`, "success");
+    if (m.issues.length) void confirmDialog("Hinweise zur Übernahme", reportText(m), "OK", false, true);
+  }
   void requestPersistentStorage();
   void registerServiceWorker();
 
   if (isNative) {
-    // Beim Wechsel in den Hintergrund sofort sichern, beim Zurückkommen aktualisieren
-    void App.addListener("pause", () => void flushBackup());
+    // Beim Wechsel in den Hintergrund ausstehende Sicherung sofort schreiben
+    void App.addListener("pause", () => void backups.flush());
     void App.addListener("resume", () => {
-      void update((d) => void autoArchive(d), { silent: true });
+      void update((d) => void autoArchive(d), { onlyIfChanged: true }).catch(() => {});
+      if (backups.isDirty() || backups.status.phase === "error") backups.schedule(1000);
     });
-    // Erste Sicherung nach dem Start, falls heute noch keine existiert
-    const last = getState().meta.lastBackupAt;
-    if (getState().slots.length && (!last || dateStamp(new Date(last)) !== dateStamp())) void runBackup();
+    // Nach dem Start: noch nicht gesicherte Änderungen nachholen
+    if (backups.isDirty()) backups.schedule(1500);
+  } else {
+    // Anderer Browser-Tab hat gespeichert → neu laden statt später zu überschreiben
+    window.addEventListener("storage", (e) => {
+      if (e.key === "seeyou_state_v2") void store.reload();
+    });
   }
   // Ansicht minütlich aktualisieren (Status "vorbei", relative Zeiten)
   setInterval(render, 60_000);

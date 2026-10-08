@@ -1,0 +1,175 @@
+# iOS-App: Kompilier-Prüfung und Upload zu TestFlight.
+#
+# Wann läuft was?
+#   • Pull Request mit Änderungen am iOS-/App-Code → „Kompilier-Prüfung“ (unsigniert, ohne Secrets).
+#   • Label „testflight“ am Pull Request setzen   → Build wird signiert und zu TestFlight hochgeladen
+#     (so lässt sich die App vor dem Merge auf dem iPhone testen).
+#   • Actions → „iOS-App“ → Run workflow           → Upload zu TestFlight (erst sichtbar, wenn diese
+#     Datei auf dem Standard-Branch liegt; dort lässt sich der Branch auswählen).
+#
+# Benötigte Secrets (Settings → Secrets and variables → Actions):
+#   APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 – siehe docs/UMSTIEG.md
+name: iOS-App
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "ios/**"
+      - "src/**"
+      - "index.html"
+      - "public/**"
+      - "package.json"
+      - "package-lock.json"
+      - "capacitor.config.ts"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}-${{ github.event.action == 'labeled' && 'upload' || 'check' }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Kompilier-Prüfung (Simulator, unsigniert)
+    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Neueste stabile Xcode-Version wählen
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -viE 'beta|rc' | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+      - name: Web-Teil bauen und ins iOS-Projekt kopieren
+        run: |
+          npx vite build
+          npx cap sync ios
+      - name: App für den Simulator bauen
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -resultBundlePath "$RUNNER_TEMP/check.xcresult" \
+            CODE_SIGNING_ALLOWED=NO | tail -200
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ios-check-log
+          path: ${{ runner.temp }}/check.xcresult
+          retention-days: 7
+
+  testflight:
+    name: Build & Upload zu TestFlight
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'testflight')
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secrets vorhanden?
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          missing=""
+          for v in TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do [ -z "${!v}" ] && missing="$missing $v"; done
+          if [ -n "$missing" ]; then echo "::error::Fehlende Secrets:$missing (siehe docs/UMSTIEG.md, Schritt 5)"; exit 1; fi
+          case "$ASC_KEY_P8" in *"BEGIN PRIVATE KEY"*) ;; *) echo "::error::ASC_KEY_P8 muss den kompletten Inhalt der .p8-Datei enthalten"; exit 1;; esac
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Neueste stabile Xcode-Version wählen
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -viE 'beta|rc' | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+      - name: Web-Teil bauen und ins iOS-Projekt kopieren
+        run: |
+          npx vite build
+          npx cap sync ios
+      - name: App Store Connect API-Schlüssel ablegen
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8"
+      - name: Archiv bauen (automatische Signierung über den API-Schlüssel)
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          # eindeutig und steigend, auch bei erneutem Ausführen desselben Laufs
+          BUILD=$(( ${{ github.run_number }} * 10 + ${{ github.run_attempt }} ))
+          echo "Version $VERSION, Build $BUILD"
+          xcodebuild archive \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -resultBundlePath "$RUNNER_TEMP/archive.xcresult" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD" | tail -200
+      - name: Prüfen, ob die iCloud-Berechtigung im signierten Build steckt
+        run: |
+          codesign -d --entitlements :- "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" > "$RUNNER_TEMP/ent.plist"
+          cat "$RUNNER_TEMP/ent.plist"
+          grep -q "iCloud.de.seeyou.workshops" "$RUNNER_TEMP/ent.plist" || { echo "::error::iCloud-Container fehlt im Provisioning Profile (siehe docs/UMSTIEG.md, Schritt 2)"; exit 1; }
+      - name: Zu App Store Connect / TestFlight hochladen
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          sed "s/TEAM_ID_PLACEHOLDER/$TEAM_ID/" ios/App/ci/ExportOptions.plist > "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" | tail -100
+          echo "### Hochgeladen ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "Der Build erscheint nach der Verarbeitung durch Apple (meist 10–30 Min.) in App Store Connect → TestFlight." >> "$GITHUB_STEP_SUMMARY"
+      - name: Schlüssel entfernen
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ios-testflight-log
+          path: ${{ runner.temp }}/*.xcresult
+          retention-days: 7

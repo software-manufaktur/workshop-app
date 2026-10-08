@@ -1,29 +1,82 @@
 // Plattform-Abstraktion: Web (PWA/Browser) vs. native iOS-App (Capacitor).
 import { Capacitor, registerPlugin } from "@capacitor/core";
-import { Preferences } from "@capacitor/preferences";
 import { Filesystem, Directory, Encoding } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
 import { AppLauncher } from "@capacitor/app-launcher";
+import {
+  BackupExistsError,
+  WebRestorePointDriver,
+  WebStateStorage,
+  type BackupDriver,
+  type BackupFileInfo,
+  type BackupLocation,
+  type StateStorage,
+  type StoredState,
+} from "./storage";
 
 export const isNative = Capacitor.isNativePlatform();
 
-/* ---------- Persistenz des App-Zustands ---------- */
+/* ---------- Natives Plugin (ios/App/App/SeeYouStoragePlugin.swift) ---------- */
 
-const STATE_KEY = "seeyou_state_v2";
-
-export async function loadRaw(): Promise<string | null> {
-  if (isNative) return (await Preferences.get({ key: STATE_KEY })).value;
-  return localStorage.getItem(STATE_KEY);
+interface SeeYouStoragePlugin {
+  loadState(): Promise<{ data?: string; previous?: string }>;
+  saveState(opts: { data: string }): Promise<void>;
+  preserveCorrupt(opts: { data: string }): Promise<void>;
+  backupStatus(): Promise<{ icloud: boolean }>;
+  backupWrite(opts: { name: string; data: string; mode: "create" | "replace" }): Promise<{ location: BackupLocation }>;
+  backupList(): Promise<{ files: BackupFileInfo[] }>;
+  backupRead(opts: { name: string; location: BackupLocation }): Promise<{ data: string }>;
+  backupRemove(opts: { name: string; location: BackupLocation }): Promise<void>;
+  backupTransfer(): Promise<{ moved: number; renamed: number; duplicates: number }>;
 }
 
-export async function saveRaw(json: string): Promise<void> {
-  if (isNative) {
-    await Preferences.set({ key: STATE_KEY, value: json });
-    return;
+const Native = registerPlugin<SeeYouStoragePlugin>("SeeYouStorage");
+
+class NativeStateStorage implements StateStorage {
+  async load(): Promise<StoredState> {
+    const r = await Native.loadState();
+    return { data: r.data ?? null, previous: r.previous ?? null };
   }
-  localStorage.setItem(STATE_KEY, json);
-  // Lesen nach Schreiben: iOS kann bei vollem Speicher still scheitern
-  if (localStorage.getItem(STATE_KEY) !== json) throw new Error("Speichern auf dem Gerät fehlgeschlagen");
+  save(json: string) {
+    return Native.saveState({ data: json });
+  }
+  preserveCorrupt(raw: string) {
+    return Native.preserveCorrupt({ data: raw });
+  }
+}
+
+class NativeBackupDriver implements BackupDriver {
+  status() {
+    return Native.backupStatus();
+  }
+  async write(name: string, data: string, mode: "create" | "replace") {
+    try {
+      return await Native.backupWrite({ name, data, mode });
+    } catch (err) {
+      if ((err as { code?: string }).code === "EXISTS") throw new BackupExistsError(name);
+      throw err;
+    }
+  }
+  async list() {
+    return (await Native.backupList()).files;
+  }
+  async read(name: string, location: BackupLocation) {
+    return (await Native.backupRead({ name, location })).data;
+  }
+  remove(name: string, location: BackupLocation) {
+    return Native.backupRemove({ name, location });
+  }
+  transferLocalToICloud() {
+    return Native.backupTransfer();
+  }
+}
+
+export function createStateStorage(): StateStorage {
+  return isNative ? new NativeStateStorage() : new WebStateStorage();
+}
+
+export function createBackupDriver(): BackupDriver {
+  return isNative ? new NativeBackupDriver() : new WebRestorePointDriver();
 }
 
 export const legacyGet = (key: string) => (isNative ? null : localStorage.getItem(key));
@@ -38,24 +91,6 @@ export async function requestPersistentStorage(): Promise<void> {
   }
 }
 
-/* ---------- iCloud-Sicherung (eigenes natives Plugin, siehe ios/App/App/ICloudBackupPlugin.swift) ---------- */
-
-export interface BackupFile {
-  name: string;
-  modifiedAt: string;
-  size: number;
-}
-
-interface ICloudBackupPlugin {
-  status(): Promise<{ available: boolean; location: "icloud" | "local" }>;
-  write(opts: { name: string; data: string }): Promise<{ location: "icloud" | "local" }>;
-  list(): Promise<{ files: BackupFile[] }>;
-  read(opts: { name: string }): Promise<{ data: string }>;
-  remove(opts: { name: string }): Promise<void>;
-}
-
-export const ICloudBackup = registerPlugin<ICloudBackupPlugin>("ICloudBackup");
-
 /* ---------- Dateien teilen / herunterladen ---------- */
 
 export async function shareFile(fileName: string, content: string, mime: string): Promise<void> {
@@ -66,7 +101,12 @@ export async function shareFile(fileName: string, content: string, mime: string)
       directory: Directory.Cache,
       encoding: Encoding.UTF8,
     });
-    await Share.share({ title: fileName, files: [res.uri] });
+    try {
+      await Share.share({ title: fileName, files: [res.uri] });
+    } finally {
+      // Kopie mit Teilnehmerdaten nicht im Cache liegen lassen
+      await Filesystem.deleteFile({ path: fileName, directory: Directory.Cache }).catch(() => {});
+    }
     return;
   }
   const blob = new Blob([content], { type: mime });

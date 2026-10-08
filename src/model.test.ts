@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CONFIRMATION_TEMPLATE,
+  normalizeWithReport,
   autoArchive,
   emptyState,
   fromLegacyLocalStorage,
@@ -29,9 +30,11 @@ describe("normalizeState", () => {
   it("übernimmt Sicherungen der alten Web-App vollständig", () => {
     const s = normalizeState(legacyBackup);
     expect(s.schemaVersion).toBe(2);
-    expect(s.slots).toHaveLength(2);
+    expect(s.slots).toHaveLength(3); // 2 + Ersatz-Termin für die verwaiste Buchung
     expect(s.slots[1].capacity).toBe(8);
-    expect(s.bookings.map((b) => b.id)).toEqual(["b1", "b2"]); // verwaiste Buchung fällt weg
+    expect(s.bookings.map((b) => b.id)).toEqual(["b1", "b2", "b3"]); // nichts fällt weg
+    const waise = s.bookings.find((b) => b.id === "b3")!;
+    expect(s.slots.find((x) => x.id === waise.slotId)).toMatchObject({ title: "Unbekannter Termin", archived: true });
     expect(s.bookings[0]).toMatchObject({ name: "Anna", salutation: "Liebe", count: 2, email: "", reviewConsent: false, reviewRequestedAt: null });
     expect(s.bookings[1].salutation).toBe("Liebe/r");
     expect(s.settings.confirmationTemplate).toBe(DEFAULT_CONFIRMATION_TEMPLATE);
@@ -39,7 +42,7 @@ describe("normalizeState", () => {
 
   it("versteht das Format der tempio-Entwicklungsversion", () => {
     const s = normalizeState({ version: 1, state: { slots: legacyBackup.slots, bookings: legacyBackup.bookings } });
-    expect(s.slots).toHaveLength(2);
+    expect(s.bookings).toHaveLength(3);
   });
 
   it("ist idempotent für den aktuellen Stand", () => {
@@ -52,10 +55,15 @@ describe("normalizeState", () => {
     expect(() => normalizeState(null)).toThrow();
   });
 
-  it("verwirft kaputte Einträge statt abzustürzen", () => {
-    const s = normalizeState({ slots: [{ id: "x" }, null, { id: "y", starts_at: "2025-01-01T10:00:00Z" }], bookings: [42] });
-    expect(s.slots.map((x) => x.id)).toEqual(["y"]);
-    expect(s.slots[0].ends_at).toBe("2025-01-01T12:00:00.000Z");
+  it("bewahrt kaputte Einträge auf statt sie zu verwerfen", () => {
+    const { state: s, report } = normalizeWithReport({ slots: [{ id: "x" }, null, { id: "y", starts_at: "2025-01-01T10:00:00Z" }], bookings: [42] });
+    expect(s.slots.map((x) => x.id)).toEqual(["x", "y"]);
+    expect(s.slots[0].title).toBe("Workshop (Datum ungültig)");
+    expect(s.slots[0].archived).toBe(true);
+    expect(s.slots[1].ends_at).toBe("2025-01-01T12:00:00.000Z");
+    expect(s.quarantine.map((q) => q.raw)).toEqual([null, 42]);
+    expect(report.quarantined).toBe(2);
+    expect(report.issues.length).toBeGreaterThan(0);
   });
 
   it("stellt sicher, dass 'Sonstiges' als Kategorie existiert", () => {
@@ -72,8 +80,8 @@ describe("fromLegacyLocalStorage", () => {
       seeyou_whatsapp_template_v1: JSON.stringify("Hallo [Name]!"),
       seeyou_collapsed_slots_v1: JSON.stringify(["s1", "weg"]),
     };
-    const s = fromLegacyLocalStorage((k) => store[k] ?? null)!;
-    expect(s.bookings).toHaveLength(2);
+    const s = fromLegacyLocalStorage((k) => store[k] ?? null)!.state;
+    expect(s.bookings).toHaveLength(3); // auch die Buchung ohne Termin bleibt erhalten
     expect(s.settings.confirmationTemplate).toBe("Hallo [Name]!");
     expect(s.ui.collapsedSlots).toEqual(["s1"]);
   });
@@ -84,7 +92,7 @@ describe("fromLegacyLocalStorage", () => {
 });
 
 describe("Status & Archiv", () => {
-  const state = normalizeState(legacyBackup);
+  const state = normalizeState({ slots: legacyBackup.slots, bookings: legacyBackup.bookings.slice(0, 2) });
   it("berechnet den Status", () => {
     expect(slotStatus(state, state.slots[0], new Date("2025-09-19T00:00:00Z"))).toBe("open");
     expect(slotStatus(state, state.slots[0], new Date("2025-09-21T00:00:00Z"))).toBe("past");
@@ -124,7 +132,7 @@ describe("Escaping & Export", () => {
   });
 
   it("CSV: Anführungszeichen, Semikolon und Formel-Injection", () => {
-    const s = normalizeState(legacyBackup);
+    const s = normalizeState({ slots: legacyBackup.slots, bookings: legacyBackup.bookings.slice(0, 2) });
     s.bookings[0].name = '=HYPERLINK("x")';
     s.bookings[0].notes = 'sagt "hallo"; tschüss';
     const csv = buildCsv(s);

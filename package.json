@@ -11,13 +11,15 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "ios:sync": "npm run build && cap sync ios",
-    "ios:open": "cap open ios"
+    "ios:open": "cap open ios",
+    "e2e": "playwright test"
   },
   "engines": {
     "node": ">=22"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.5.3",
+    "@playwright/test": "^1.64.0",
     "@tailwindcss/vite": "^4.3.3",
     "jsdom": "^29.1.1",
     "tailwindcss": "^4.3.3",
@@ -32,7 +34,6 @@
     "@capacitor/core": "^8.5.3",
     "@capacitor/filesystem": "^8.1.4",
     "@capacitor/ios": "^8.5.3",
-    "@capacitor/preferences": "^8.0.1",
     "@capacitor/share": "^8.0.3"
   }
 }
