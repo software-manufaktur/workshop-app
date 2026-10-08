@@ -129,12 +129,14 @@ Ziel war eine wartungsarme iOS-App mit zuverlässiger lokaler Speicherung, autom
 | Swift-Plugin: Typprüfung | `swiftc -typecheck` (Swift 6.1, Linux) gegen Stubs der Capacitor-8-API | ✅ |
 | Swift-Plugin: Dateilogik (atomares Speichern + Vorversion, Nicht-Überschreiben, Platzhalter, Namensprüfung, lokaler Fallback, Übertragung, Duplikate, Löschen) | ausgeführt auf Linux mit simuliertem iCloud, `ios/native-tests/` | ✅ 26/26 |
 | Plists, Entitlements, Privacy-Manifest, Xcode-Schema, Workflows | Syntaxprüfung (plistlib, XML, YAML), Projektdatei auf Konsistenz geprüft | ✅ |
+| **Native iOS-App kompilieren (Xcode, Swift Package Manager, Capacitor 8, eigenes Plugin)** | GitHub Actions `iOS-App → Kompilier-Prüfung` auf macOS 15, Simulator, unsigniert (Run 37758914199, Commit 73d83d7) | ✅ erfolgreich |
+| CI auf GitHub (Typecheck, Unit-, E2E- und Swift-Plugin-Tests) | Run 37758914162 | ✅ alle Jobs grün |
 
 ### Noch **nicht** auf einem echten iPhone bzw. mit Xcode verifiziert
 
-In dieser Umgebung gibt es weder macOS noch Xcode. Ein nativer iOS-Build war hier **nicht möglich**. Offen sind damit:
+In dieser Umgebung gibt es weder macOS noch Xcode. Ein nativer iOS-Build war in der Entwicklungsumgebung **nicht möglich**; der Simulator-Build wurde deshalb auf einem macOS-Runner von GitHub durchgeführt (erfolgreich). Offen sind damit:
 
-1. **Kompilieren in Xcode** (inkl. Swift-Package-Auflösung von Capacitor). Wird durch die neue **Kompilier-Prüfung** im PR auf einem macOS-Runner von GitHub nachgeholt.
+1. ~~Kompilieren in Xcode~~ → inzwischen auf einem macOS-Runner von GitHub erfolgreich (siehe Tabelle). Offen bleibt der **signierte Release-Build** für ein echtes Gerät.
 2. **Signierung und Upload zu TestFlight** (Apple-Konten, API-Schlüssel, iCloud-Container im Profil).
 3. **Echtes iCloud-Verhalten:** Erreichbarkeit des Containers, Sichtbarkeit des Ordners „SeeYou Workshops“ in der Dateien-App, Hoch-/Herunterladen, Platzhalter nach Neuinstallation, Übertragung lokaler Dateien mit `setUbiquitous`.
 4. **WKWebView-spezifisches Verhalten:** Dateiauswahl beim Import, Teilen-Dialog beim Export, Öffnen von WhatsApp/Mail über `AppLauncher`, Ereignisse `pause`/`resume`.
@@ -164,7 +166,7 @@ In dieser Umgebung gibt es weder macOS noch Xcode. Ein nativer iOS-Build war hie
 
 **Erster TestFlight-Build: Freigabe empfohlen**, als interner Test unter folgenden Bedingungen:
 
-1. Die **Kompilier-Prüfung** („iOS-App → Kompilier-Prüfung“) ist im PR grün.
+1. ✅ Die **Kompilier-Prüfung** („iOS-App → Kompilier-Prüfung“) ist im PR grün (erfüllt am 08.10.2026).
 2. Stefanies Daten sind **vorher** aus der alten App gesichert und die Datei ist geprüft (Anleitung Schritt 1, inkl. zweiter Kopie und WhatsApp-Vorlage).
 3. Der erste Build wird zunächst **auf deinem eigenen iPhone** mit einer Kopie der Sicherungsdatei getestet: Import, iCloud-Sicherung (Schritt 9) und Neuinstallation/Wiederherstellung (Schritt 10).
 4. Erst danach Installation bei Stefanie; die alte App bleibt 2–4 Wochen als Rückfallebene erhalten.
