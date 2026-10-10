@@ -48,6 +48,11 @@ Auf **Stefanies iPhone**, in der **alten App** (Icon auf dem Home-Bildschirm öf
    - Unter **Capabilities** **iCloud** anhaken (inkl. CloudKit/iCloud Documents) → **Continue → Register**.
 5. Die eben angelegte App-ID öffnen → bei **iCloud** auf **Configure/Edit** → den Container `iCloud.de.seeyou.workshops` anhaken → **Save**.
 
+6. **Mindestens ein iPhone registrieren** (Pflicht, sonst bricht der Build mit „Your team has no devices“ ab): **Devices → +** → Plattform iOS, Name z. B. `Stefanies iPhone`, **Device ID (UDID)** eintragen → **Register**. Die UDID findest du so:
+   - **Mac:** iPhone per Kabel anschließen → Finder → iPhone auswählen → unter dem Gerätenamen so oft auf die Zeile mit Seriennummer/Modell klicken, bis „UDID“ erscheint → Rechtsklick → kopieren.
+   - **Windows:** iPhone per Kabel anschließen → App **Apple-Geräte** (oder iTunes) → iPhone → auf die **Seriennummer** klicken, bis die UDID erscheint → markieren und kopieren.
+   Es reicht ein Gerät (deins oder Stefanies). Für TestFlight muss Stefanies iPhone **nicht** registriert sein.
+
 Zertifikate und Provisioning Profiles musst du **nicht** anlegen. Das übernimmt der Build automatisch über den API-Schlüssel (Schritt 4).
 
 > Andere Bundle-ID gewünscht? Dann vorher im Code an vier Stellen ändern: `capacitor.config.ts`, `ios/App/App.xcodeproj/project.pbxproj`, `ios/App/App/App.entitlements`, `ios/App/App/Info.plist` sowie `ios/App/App/SeeYouStoragePlugin.swift` (`containerId`).
@@ -104,7 +109,8 @@ Bei jeder Änderung am iOS-Teil im Pull Request läuft außerdem automatisch ein
 | Fehlermeldung im Build | Ursache / Lösung |
 |---|---|
 | `Fehlende Secrets` | Schritt 5 prüfen (Schreibweise der Namen) |
-| `No profiles for 'de.seeyou.workshops'` / `No Accounts` | API-Schlüssel hat nicht die Rolle **Admin**, oder Team-ID falsch |
+| `Your team has no devices from which to generate a provisioning profile` | Schritt 2.6: ein iPhone im Developer-Portal registrieren, dann Label neu setzen |
+| `No profiles for 'de.seeyou.workshops'` / `No Accounts` | Meist Folge der Zeile darüber; sonst API-Schlüssel ohne Rolle **Admin** oder Team-ID falsch |
 | `iCloud-Container fehlt im Provisioning Profile` | Schritt 2.3–2.5: Container anlegen **und** der App-ID zuweisen |
 | `No suitable application records were found` | Schritt 3.1: App in App Store Connect fehlt oder Bundle-ID abweichend |
 | `The bundle version must be higher` | Build einfach erneut starten (Build-Nummer steigt automatisch) |

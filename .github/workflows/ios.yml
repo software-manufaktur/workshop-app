@@ -141,6 +141,12 @@ jobs:
             CODE_SIGN_STYLE=Automatic \
             MARKETING_VERSION="$VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD" | tail -200
+      - name: Hinweis bei Signierfehler
+        if: failure()
+        run: |
+          echo "::error::Signierung fehlgeschlagen. Häufigste Ursache: Im Apple-Developer-Konto ist noch kein iPhone registriert (Meldung 'Your team has no devices'). Siehe docs/UMSTIEG.md, Schritt 2.6."
+          echo "### ❌ Signierung fehlgeschlagen" >> "$GITHUB_STEP_SUMMARY"
+          echo "Häufigste Ursache: kein registriertes iPhone im Developer-Portal (docs/UMSTIEG.md, Schritt 2.6). Danach das Label \`testflight\` entfernen und neu setzen." >> "$GITHUB_STEP_SUMMARY"
       - name: Prüfen, ob die iCloud-Berechtigung im signierten Build steckt
         run: |
           codesign -d --entitlements :- "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" > "$RUNNER_TEMP/ent.plist"
